@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # A workflow that fails to PARSE reports nothing at all: no jobs run, no
+  # checks appear, and the pull request looks unexercised rather than broken.
+  actionlint:
+    name: workflows parse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  darwin:
+    name: darwin (real frameworks, CGO=0)
+    runs-on: macos-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Tidy is committed
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - name: Vet
+        run: CGO_ENABLED=0 go vet ./...
+      - name: Test
+        run: CGO_ENABLED=0 go test -coverprofile=cover.out ./...
+      # The three platform functions reach a fingerprint sensor and a plugged-in
+      # key. A runner has neither, and a test that popped a biometric prompt
+      # would be a test nobody could run twice. So the coverage GATE lives on
+      # the linux lane, over everything that exists without hardware; here the
+      # number is only printed.
+      - name: Coverage summary
+        run: go tool cover -func=cover.out | tail -5
+      - name: Race
+        run: CGO_ENABLED=1 go test -race ./...
+
+  linux:
+    name: linux (stub + coverage gate)
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: go vet ./...
+      - name: Build everything
+        run: go build ./...
+      - name: Test
+        run: go test -coverprofile=cover.out .
+      - name: 100% coverage gate on everything that exists off darwin
+        run: |
+          go tool cover -func=cover.out | tee full.txt
+          if grep -v '100\.0%' full.txt | grep -v '^total:'; then
+            echo "::error::below 100% on linux (lines above)"; exit 1
+          fi
+
+  windows:
+    name: windows (stub build)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      CGO_ENABLED: "0"
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test ./...
