@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/go-authn/keyfactor"
 	"github.com/go-authn/mfa"
 )
 
@@ -86,16 +87,6 @@ func (f touchIDFactor) Kind() mfa.Kind {
 	return mfa.Unknown
 }
 
-// keyFactor asks a security key.
-type keyFactor struct {
-	rpID       string
-	credential []byte
-	// verify demands that the key verify WHO is holding it -- a PIN or its own
-	// sensor -- rather than merely that somebody touched it.
-	verify bool
-	pin    string
-}
-
 // SecurityKey is a registered credential as a factor: the key must be present
 // and a human must touch it.
 //
@@ -106,8 +97,12 @@ type keyFactor struct {
 // This proves POSSESSION and nothing more. A key on a desk that anybody can
 // reach is still a key anybody can reach, which is exactly why it belongs
 // alongside a factor of another kind rather than alone.
+//
+// The asking itself is [keyfactor]'s: it is the same everywhere CTAP is, and
+// this package once carried its own copy. What is macOS's is [platformOpen] —
+// finding the key, and knowing what its absence means.
 func SecurityKey(rpID string, credentialID []byte) mfa.Factor {
-	return keyFactor{rpID: rpID, credential: credentialID}
+	return keyfactor.New(open, keyfactor.Options{RPID: rpID, CredentialID: credentialID})
 }
 
 // VerifiedSecurityKey is the same, with the key asked to verify who holds it.
@@ -117,33 +112,40 @@ func SecurityKey(rpID string, credentialID []byte) mfa.Factor {
 // exchange. It is still a secret in a Go string, so a caller that can avoid
 // holding one should.
 //
-// A wrong PIN costs the key a retry and a key that runs out locks. This asks
-// the key how many are left first, and refuses rather than spending the last
-// one blindly.
+// A wrong PIN costs the key a retry and a key that runs out locks. The key is
+// asked how many are left first, and refuses rather than spending the last one
+// blindly.
 func VerifiedSecurityKey(rpID string, credentialID []byte, pin string) mfa.Factor {
-	return keyFactor{rpID: rpID, credential: credentialID, verify: true, pin: pin}
-}
-
-func (f keyFactor) Name() string {
-	if f.verify {
-		return "your security key and its PIN"
+	if pin == "" {
+		// Passing no PIN here is not a request for a weaker factor; it is a
+		// mistake. Quietly returning an UNVERIFIED key would hand a caller
+		// less proof than they asked for and never say so.
+		return refusing{
+			name: "your security key and its PIN",
+			err:  errors.New("factors: a verified security key was asked for without a PIN"),
+		}
 	}
-	return "your security key"
+	return keyfactor.New(open, keyfactor.Options{
+		RPID: rpID, CredentialID: credentialID, PIN: pin,
+	})
 }
 
-// Kind is possession even when a PIN is involved.
-//
-// A PIN entered INTO THE KEY is not a factor a policy can count separately: it
-// never reaches the platform, it protects the key rather than identifying the
-// person to us, and counting it would let one object masquerade as two
-// factors. What it changes is the strength of the possession proof, which shows
-// up as the verified bit in the assertion, not as a second kind.
-func (f keyFactor) Kind() mfa.Kind { return mfa.Possession }
+// refusing is a factor that reports a caller's mistake when asked, rather than
+// at construction: [mfa.Factor] has nowhere to return an error until Verify.
+type refusing struct {
+	name string
+	err  error
+}
+
+func (f refusing) Name() string                 { return f.name }
+func (f refusing) Kind() mfa.Kind               { return mfa.Possession }
+func (f refusing) Verify(context.Context) error { return f.err }
 
 // unavailable wraps err as something a policy treats as "not asked".
-func unavailable(err error) error {
-	return fmt.Errorf("%w: %w", mfa.ErrUnavailable, err)
-}
+//
+// It delegates so that there is ONE definition of what unavailable means
+// across the stack, rather than two that agree until one is edited.
+func unavailable(err error) error { return keyfactor.Unavailable(err) }
 
 // asUnavailable reports whether err is one of the "there is nothing here to
 // ask" conditions rather than a refusal.
@@ -157,11 +159,11 @@ func asUnavailable(err error, sentinels ...error) bool {
 }
 
 // The seams every factor goes through, so a test can drive a sensor that
-// refuses, a sensor that is not there, a key that is unplugged and a key whose
-// PIN is wrong -- on a machine where all four behave.
+// refuses, a sensor that is not there and a key that is unplugged -- on a
+// machine where none of those happen.
 var (
-	askSensor = platformAskSensor
-	askKey    = platformAskKey
+	askSensor                  = platformAskSensor
+	open      keyfactor.Opener = platformOpen
 )
 
 // Verify asks the sensor.
@@ -173,15 +175,4 @@ func (f touchIDFactor) Verify(ctx context.Context) error {
 		return fmt.Errorf("factors: a Touch ID prompt needs a reason to show the person")
 	}
 	return askSensor(ctx, f.reason, f.biometryOnly)
-}
-
-// Verify asks the key.
-func (f keyFactor) Verify(ctx context.Context) error {
-	if f.rpID == "" {
-		return fmt.Errorf("factors: a security key needs a relying party id to assert for")
-	}
-	if f.verify && f.pin == "" {
-		return fmt.Errorf("factors: %s was asked to verify without a PIN", f.Name())
-	}
-	return askKey(ctx, f)
 }
