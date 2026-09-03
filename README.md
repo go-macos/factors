@@ -18,6 +18,16 @@ if err != nil {
 }
 ```
 
+## Almost none of the key factor is here any more
+
+Asking a security key is the same everywhere CTAP is, so it lives once, in
+[go-authn/keyfactor](https://github.com/go-authn/keyfactor): the challenge, the
+assertion, the flag checks, the refusal to spend somebody's last PIN attempt.
+It lived HERE first, and was one copy away from living in a Linux package too.
+
+What stays is what macOS owns — `platformAskSensor`, and `platformOpen` finding
+the key and knowing that an empty USB port has refused nobody.
+
 ## Why this is a separate package
 
 Nothing in [go-macos/localauthentication](https://github.com/go-macos/localauthentication)
@@ -67,7 +77,7 @@ Everything portable is covered to 100%, on Linux, with no hardware: the
 classification, the kinds, the incomplete-request refusals, and the
 absent-versus-refused split all go through the `askSensor`/`askKey` seams.
 
-The three platform functions are not covered, and the gate says so rather than
+The two platform functions are not covered, and the gate says so rather than
 pretending otherwise. They reach a fingerprint sensor and a plugged-in key; a
 test that popped a biometric prompt would be a test nobody could run twice, and
 a runner has neither device. They have been exercised by hand against a real

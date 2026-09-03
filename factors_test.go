@@ -10,19 +10,28 @@ import (
 	"strings"
 	"testing"
 
+	fido "github.com/go-authn/fido"
 	"github.com/go-authn/mfa"
 )
 
+// errNoKeyHere is what a fake opener reports.
+//
+// Whether a key that ANSWERS satisfies the factor is
+// github.com/go-authn/keyfactor's question, and it is tested there against a
+// fake authenticator. What is left here is what macOS owns: finding the key,
+// and what its absence means.
+var errNoKeyHere = errors.New("no security key is attached")
+
 // swap installs fake platform answers and puts the real ones back.
-func swap(t *testing.T, sensor func(context.Context, string, bool) error, key func(context.Context, keyFactor) error) {
+func swap(t *testing.T, sensor func(context.Context, string, bool) error, key func(context.Context) (fido.Transport, error)) {
 	t.Helper()
-	os_, ok := askSensor, askKey
-	t.Cleanup(func() { askSensor, askKey = os_, ok })
+	oldSensor, oldOpen := askSensor, open
+	t.Cleanup(func() { askSensor, open = oldSensor, oldOpen })
 	if sensor != nil {
 		askSensor = sensor
 	}
 	if key != nil {
-		askKey = key
+		open = key
 	}
 }
 
@@ -41,17 +50,7 @@ func TestTheTwoFactorsAreOfDifferentKinds(t *testing.T) {
 	if touch.Kind() == key.Kind() {
 		t.Fatal("the two factors are the same kind, so the pair is not two factors")
 	}
-
-	swap(t, func(context.Context, string, bool) error { return nil },
-		func(context.Context, keyFactor) error { return nil })
-	r, err := mfa.Verify(context.Background(), mfa.Policy{Count: 2, DistinctKinds: true}, touch, key)
-	if err != nil {
-		t.Fatalf("the pair did not satisfy a two-kind policy: %v", err)
-	}
-	if r.Kinds != 2 {
-		t.Errorf("%d kinds among the pair", r.Kinds)
-	}
-	// And neither twice does.
+	// And two keys never satisfy a two-KIND policy, whatever they answer.
 	if _, err := mfa.Verify(context.Background(),
 		mfa.Policy{Count: 2, DistinctKinds: true},
 		SecurityKey("example.test", []byte("a")), SecurityKey("example.test", []byte("b")),
@@ -61,8 +60,7 @@ func TestTheTwoFactorsAreOfDifferentKinds(t *testing.T) {
 }
 
 // TestAPINIsNotASecondFactor. A PIN entered into the key never reaches the
-// platform and protects the key rather than identifying the person to us;
-// counting it separately would let one object masquerade as two factors.
+// platform, and counting it would let one object masquerade as two factors.
 func TestAPINIsNotASecondFactor(t *testing.T) {
 	if got := VerifiedSecurityKey("example.test", []byte("c"), "0000").Kind(); got != mfa.Possession {
 		t.Errorf("a key with a PIN is %v, want possession", got)
@@ -80,17 +78,11 @@ func TestDeviceOwnerWillNotClaimAKind(t *testing.T) {
 		t.Errorf("Name() = %q, which does not warn that a password will do", f.Name())
 	}
 	// So it never counts towards distinct kinds, even paired with a key.
-	swap(t, func(context.Context, string, bool) error { return nil },
-		func(context.Context, keyFactor) error { return nil })
+	swap(t, func(context.Context, string, bool) error { return nil }, nil)
 	if _, err := mfa.Verify(context.Background(),
 		mfa.Policy{Count: 2, DistinctKinds: true}, f, SecurityKey("example.test", nil),
 	); err == nil {
 		t.Error("an unclassified factor was counted towards a kind")
-	}
-	// It does satisfy a plain count, which is a different request.
-	if _, err := mfa.Verify(context.Background(),
-		mfa.Policy{Count: 2}, f, SecurityKey("example.test", nil)); err != nil {
-		t.Errorf("a plain count of two refused two answers: %v", err)
 	}
 }
 
@@ -99,7 +91,7 @@ func TestDeviceOwnerWillNotClaimAKind(t *testing.T) {
 func TestNothingHereToAskIsNotAFailure(t *testing.T) {
 	swap(t,
 		func(context.Context, string, bool) error { return unavailable(errors.New("no sensor")) },
-		func(context.Context, keyFactor) error { return unavailable(errors.New("no key")) })
+		func(context.Context) (fido.Transport, error) { return nil, unavailable(errNoKeyHere) })
 
 	r, err := mfa.Verify(context.Background(), mfa.Policy{Count: 1},
 		TouchID("unlock"), SecurityKey("example.test", nil))
@@ -111,19 +103,15 @@ func TestNothingHereToAskIsNotAFailure(t *testing.T) {
 			t.Errorf("%s was reported as a refusal rather than as absent", a.Name)
 		}
 	}
-	// Even with StopOnFirstFailure, an absent factor does not end the attempt:
-	// nothing refused.
-	swap(t, nil, func(context.Context, keyFactor) error { return nil })
-	if _, err := mfa.Verify(context.Background(),
-		mfa.Policy{Count: 1, StopOnFirstFailure: true},
-		TouchID("unlock"), SecurityKey("example.test", nil)); err != nil {
-		t.Errorf("an absent sensor ended the attempt: %v", err)
-	}
 }
 
+// TestARefusalIsARefusal, and an ordinary failure from the opener is one:
+// only the conditions this package NAMES are excused.
 func TestARefusalIsARefusal(t *testing.T) {
-	swap(t, func(context.Context, string, bool) error { return errors.New("the finger did not match") },
-		func(context.Context, keyFactor) error { return errors.New("nobody touched it") })
+	swap(t,
+		func(context.Context, string, bool) error { return errors.New("the finger did not match") },
+		func(context.Context) (fido.Transport, error) { return nil, errors.New("the bus caught fire") })
+
 	r, err := mfa.Verify(context.Background(), mfa.Policy{Count: 1},
 		TouchID("unlock"), SecurityKey("example.test", nil))
 	if err == nil {
@@ -139,10 +127,38 @@ func TestARefusalIsARefusal(t *testing.T) {
 	}
 }
 
+// TestAVerifiedKeyWithNoPINIsAMistake, not a weaker factor.
+//
+// Quietly returning an unverified key would hand a caller less proof than they
+// asked for and never say so. The check has nowhere to live but Verify, since
+// mfa.Factor has no way to fail at construction.
+func TestAVerifiedKeyWithNoPINIsAMistake(t *testing.T) {
+	reached := 0
+	swap(t, nil, func(context.Context) (fido.Transport, error) {
+		reached++
+		return nil, errNoKeyHere
+	})
+	f := VerifiedSecurityKey("example.test", nil, "")
+	err := f.Verify(context.Background())
+	if err == nil {
+		t.Fatal("a verified key with no PIN was accepted")
+	}
+	if !strings.Contains(err.Error(), "without a PIN") {
+		t.Errorf("error = %q", err)
+	}
+	if reached != 0 {
+		t.Errorf("the key was opened %d time(s) for a request that could not be honoured", reached)
+	}
+	// It still classifies, so a policy's report reads sensibly.
+	if f.Kind() != mfa.Possession || !strings.Contains(f.Name(), "PIN") {
+		t.Errorf("%s is %v", f.Name(), f.Kind())
+	}
+}
+
 func TestAFactorRefusesAnIncompleteRequest(t *testing.T) {
 	asked := 0
 	swap(t, func(context.Context, string, bool) error { asked++; return nil },
-		func(context.Context, keyFactor) error { asked++; return nil })
+		func(context.Context) (fido.Transport, error) { asked++; return nil, errNoKeyHere })
 
 	for _, c := range []struct {
 		name string
@@ -151,7 +167,6 @@ func TestAFactorRefusesAnIncompleteRequest(t *testing.T) {
 	}{
 		{"a prompt with no reason", TouchID(""), "needs a reason"},
 		{"a key with no relying party", SecurityKey("", nil), "relying party id"},
-		{"verification with no PIN", VerifiedSecurityKey("example.test", nil, ""), "without a PIN"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			err := c.f.Verify(context.Background())
@@ -165,6 +180,22 @@ func TestAFactorRefusesAnIncompleteRequest(t *testing.T) {
 	}
 	if asked != 0 {
 		t.Errorf("the platform was asked %d time(s) for an incomplete request", asked)
+	}
+}
+
+// TestTheOpenerIsReached, so the delegation is wired rather than merely
+// compiled.
+func TestTheOpenerIsReached(t *testing.T) {
+	reached := 0
+	swap(t, nil, func(context.Context) (fido.Transport, error) {
+		reached++
+		return nil, errNoKeyHere
+	})
+	if err := SecurityKey("example.test", []byte("c")).Verify(context.Background()); err == nil {
+		t.Fatal("a factor with no key behind it succeeded")
+	}
+	if reached != 1 {
+		t.Errorf("the opener was reached %d times", reached)
 	}
 }
 
