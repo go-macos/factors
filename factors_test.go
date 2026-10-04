@@ -40,7 +40,7 @@ func swap(t *testing.T, sensor func(context.Context, string, bool) error, key fu
 // twice.
 func TestTheTwoFactorsAreOfDifferentKinds(t *testing.T) {
 	touch := TouchID("unlock the vault")
-	key := SecurityKey("example.test", []byte("cred"))
+	key := SecurityKey("example.test", []byte("cred"), testKey)
 	if touch.Kind() != mfa.Inherence {
 		t.Errorf("Touch ID is %v, want inherence", touch.Kind())
 	}
@@ -53,7 +53,7 @@ func TestTheTwoFactorsAreOfDifferentKinds(t *testing.T) {
 	// And two keys never satisfy a two-KIND policy, whatever they answer.
 	if _, err := mfa.Verify(context.Background(),
 		mfa.Policy{Count: 2, DistinctKinds: true},
-		SecurityKey("example.test", []byte("a")), SecurityKey("example.test", []byte("b")),
+		SecurityKey("example.test", []byte("a"), testKey), SecurityKey("example.test", []byte("b"), testKey),
 	); err == nil {
 		t.Error("two security keys satisfied a two-KIND policy")
 	}
@@ -62,7 +62,7 @@ func TestTheTwoFactorsAreOfDifferentKinds(t *testing.T) {
 // TestAPINIsNotASecondFactor. A PIN entered into the key never reaches the
 // platform, and counting it would let one object masquerade as two factors.
 func TestAPINIsNotASecondFactor(t *testing.T) {
-	if got := VerifiedSecurityKey("example.test", []byte("c"), "0000").Kind(); got != mfa.Possession {
+	if got := VerifiedSecurityKey("example.test", []byte("c"), testKey, "0000").Kind(); got != mfa.Possession {
 		t.Errorf("a key with a PIN is %v, want possession", got)
 	}
 }
@@ -80,7 +80,7 @@ func TestDeviceOwnerWillNotClaimAKind(t *testing.T) {
 	// So it never counts towards distinct kinds, even paired with a key.
 	swap(t, func(context.Context, string, bool) error { return nil }, nil)
 	if _, err := mfa.Verify(context.Background(),
-		mfa.Policy{Count: 2, DistinctKinds: true}, f, SecurityKey("example.test", nil),
+		mfa.Policy{Count: 2, DistinctKinds: true}, f, SecurityKey("example.test", nil, testKey),
 	); err == nil {
 		t.Error("an unclassified factor was counted towards a kind")
 	}
@@ -94,7 +94,7 @@ func TestNothingHereToAskIsNotAFailure(t *testing.T) {
 		func(context.Context) (fido.Transport, error) { return nil, unavailable(errNoKeyHere) })
 
 	r, err := mfa.Verify(context.Background(), mfa.Policy{Count: 1},
-		TouchID("unlock"), SecurityKey("example.test", nil))
+		TouchID("unlock"), SecurityKey("example.test", nil, testKey))
 	if err == nil {
 		t.Fatal("a machine with neither factor satisfied a policy")
 	}
@@ -113,7 +113,7 @@ func TestARefusalIsARefusal(t *testing.T) {
 		func(context.Context) (fido.Transport, error) { return nil, errors.New("the bus caught fire") })
 
 	r, err := mfa.Verify(context.Background(), mfa.Policy{Count: 1},
-		TouchID("unlock"), SecurityKey("example.test", nil))
+		TouchID("unlock"), SecurityKey("example.test", nil, testKey))
 	if err == nil {
 		t.Fatal("two refusals satisfied a policy")
 	}
@@ -138,7 +138,7 @@ func TestAVerifiedKeyWithNoPINIsAMistake(t *testing.T) {
 		reached++
 		return nil, errNoKeyHere
 	})
-	f := VerifiedSecurityKey("example.test", nil, "")
+	f := VerifiedSecurityKey("example.test", nil, testKey, "")
 	err := f.Verify(context.Background())
 	if err == nil {
 		t.Fatal("a verified key with no PIN was accepted")
@@ -166,7 +166,7 @@ func TestAFactorRefusesAnIncompleteRequest(t *testing.T) {
 		want string
 	}{
 		{"a prompt with no reason", TouchID(""), "needs a reason"},
-		{"a key with no relying party", SecurityKey("", nil), "relying party id"},
+		{"a key with no relying party", SecurityKey("", nil, testKey), "relying party id"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			err := c.f.Verify(context.Background())
@@ -191,7 +191,7 @@ func TestTheOpenerIsReached(t *testing.T) {
 		reached++
 		return nil, errNoKeyHere
 	})
-	if err := SecurityKey("example.test", []byte("c")).Verify(context.Background()); err == nil {
+	if err := SecurityKey("example.test", []byte("c"), testKey).Verify(context.Background()); err == nil {
 		t.Fatal("a factor with no key behind it succeeded")
 	}
 	if reached != 1 {
@@ -205,8 +205,8 @@ func TestTheFactorsSayWhatTheyAre(t *testing.T) {
 		want string
 	}{
 		{TouchID("x"), "Touch ID"},
-		{SecurityKey("a", nil), "security key"},
-		{VerifiedSecurityKey("a", nil, "0000"), "PIN"},
+		{SecurityKey("a", nil, testKey), "security key"},
+		{VerifiedSecurityKey("a", nil, testKey, "0000"), "PIN"},
 	} {
 		if !strings.Contains(c.f.Name(), c.want) {
 			t.Errorf("Name() = %q, want it to mention %q", c.f.Name(), c.want)
@@ -248,5 +248,25 @@ func TestUnavailableWrapsBothWays(t *testing.T) {
 	}
 	if !asUnavailable(err, mfa.ErrUnavailable) {
 		t.Error("asUnavailable did not match its own sentinel")
+	}
+}
+
+// ⛔ A security key factor without the credential's public key refuses, and
+// the platform is never asked: nothing could check the signature, so any
+// device that speaks CTAPHID would pass as the key (go-authn/keyfactor
+// v0.3.0, after a security audit).
+func TestASecurityKeyWithoutItsPublicKeyIsRefused(t *testing.T) {
+	asked := 0
+	swap(t, nil, func(context.Context) (fido.Transport, error) { asked++; return nil, errNoKeyHere })
+	for _, f := range []mfa.Factor{
+		SecurityKey("example.test", []byte("c"), nil),
+		VerifiedSecurityKey("example.test", []byte("c"), nil, "0000"),
+	} {
+		if err := f.Verify(context.Background()); err == nil || errors.Is(err, mfa.ErrUnavailable) {
+			t.Errorf("%s with no public key gave %v, want a refusal", f.Name(), err)
+		}
+	}
+	if asked != 0 {
+		t.Errorf("the platform was asked %d time(s)", asked)
 	}
 }

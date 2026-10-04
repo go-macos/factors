@@ -11,7 +11,7 @@ Pure Go, `CGO_ENABLED=0`.
 ```go
 r, err := mfa.Verify(ctx, mfa.Policy{Count: 2, DistinctKinds: true},
     factors.TouchID("unlock the vault"),          // something you are
-    factors.SecurityKey("example.test", credID),  // something you have
+    factors.SecurityKey("example.test", credID, pubKey),  // something you have
 )
 if err != nil {
     fmt.Println(err)  // "2 factor(s) needed, 1 answered: your security key: not plugged in"
