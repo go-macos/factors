@@ -12,7 +12,7 @@
 //
 //	r, err := mfa.Verify(ctx, mfa.Policy{Count: 2, DistinctKinds: true},
 //	    factors.TouchID("unlock the vault"),
-//	    factors.SecurityKey("example.test", credentialID),
+//	    factors.SecurityKey("example.test", credentialID, publicKey),
 //	)
 //
 // # What each factor actually proves
@@ -33,6 +33,7 @@ package factors
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"errors"
 	"fmt"
 
@@ -90,9 +91,15 @@ func (f touchIDFactor) Kind() mfa.Kind {
 // SecurityKey is a registered credential as a factor: the key must be present
 // and a human must touch it.
 //
-// credentialID is what a registration returned. Passing none asks the key for
-// a discoverable credential, which it has only if one was registered with the
-// "rk" option.
+// credentialID and publicKey are what a registration returned: the
+// credential's id, and the P-256 key from its attestation
+// (fido.AuthData.PublicKey). Passing no id asks the key for a discoverable
+// credential, which it has only if one was registered with the "rk" option.
+//
+// ⛔ The public key is required. Without it nothing could check the
+// assertion's signature, and any device that speaks CTAPHID -- a programmable
+// USB board -- would pass as the key (go-authn/keyfactor v0.3.0, after a
+// security audit). A factor built without one refuses when asked.
 //
 // This proves POSSESSION and nothing more. A key on a desk that anybody can
 // reach is still a key anybody can reach, which is exactly why it belongs
@@ -101,8 +108,8 @@ func (f touchIDFactor) Kind() mfa.Kind {
 // The asking itself is [keyfactor]'s: it is the same everywhere CTAP is, and
 // this package once carried its own copy. What is macOS's is [platformOpen] —
 // finding the key, and knowing what its absence means.
-func SecurityKey(rpID string, credentialID []byte) mfa.Factor {
-	return keyfactor.New(open, keyfactor.Options{RPID: rpID, CredentialID: credentialID})
+func SecurityKey(rpID string, credentialID []byte, publicKey *ecdsa.PublicKey) mfa.Factor {
+	return keyfactor.New(open, keyfactor.Options{RPID: rpID, CredentialID: credentialID, PublicKey: publicKey})
 }
 
 // VerifiedSecurityKey is the same, with the key asked to verify who holds it.
@@ -115,7 +122,7 @@ func SecurityKey(rpID string, credentialID []byte) mfa.Factor {
 // A wrong PIN costs the key a retry and a key that runs out locks. The key is
 // asked how many are left first, and refuses rather than spending the last one
 // blindly.
-func VerifiedSecurityKey(rpID string, credentialID []byte, pin string) mfa.Factor {
+func VerifiedSecurityKey(rpID string, credentialID []byte, publicKey *ecdsa.PublicKey, pin string) mfa.Factor {
 	if pin == "" {
 		// Passing no PIN here is not a request for a weaker factor; it is a
 		// mistake. Quietly returning an UNVERIFIED key would hand a caller
@@ -126,7 +133,7 @@ func VerifiedSecurityKey(rpID string, credentialID []byte, pin string) mfa.Facto
 		}
 	}
 	return keyfactor.New(open, keyfactor.Options{
-		RPID: rpID, CredentialID: credentialID, PIN: pin,
+		RPID: rpID, CredentialID: credentialID, PublicKey: publicKey, PIN: pin,
 	})
 }
 

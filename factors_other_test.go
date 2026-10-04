@@ -20,7 +20,7 @@ import (
 func TestOffMacOSBothFactorsAreAbsentRatherThanRefusing(t *testing.T) {
 	for _, f := range []mfa.Factor{
 		TouchID("unlock"),
-		SecurityKey("example.test", nil),
+		SecurityKey("example.test", nil, testKey),
 	} {
 		err := f.Verify(context.Background())
 		if err == nil {
