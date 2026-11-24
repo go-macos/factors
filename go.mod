@@ -1,9 +1,9 @@
 module github.com/go-macos/factors
 
-go 1.27.3
+go 1.27.4
 
 require (
-	github.com/go-authn/fido v0.13.1
+	github.com/go-authn/fido v0.15.0
 	github.com/go-authn/keyfactor v0.4.3
 	github.com/go-authn/mfa v0.5.1
 	github.com/go-macos/fido v0.6.0
